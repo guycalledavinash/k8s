@@ -1,6 +1,6 @@
 To verify
 ```
-kubectl exec -it python-deployment-74dffb6956-lsnfx -- /bin/bash
+kubectl exec -it [podname] -- /bin/bash
 ```
 ```
 ls /opt/secrets
