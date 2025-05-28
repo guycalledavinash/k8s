@@ -1,5 +1,58 @@
 ## Minikube Setup
+#### setup_script
+```
+#!/bin/bash
 
+set -e
+
+echo "Updating packages..."
+sudo apt update
+
+echo "Installing Docker..."
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker $USER
+
+echo "Installing Minikube dependencies..."
+sudo apt install -y curl wget apt-transport-https
+
+echo "Downloading Minikube..."
+wget https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+
+echo "Installing Minikube..."
+sudo cp minikube-linux-amd64 /usr/local/bin/minikube
+sudo chmod +x /usr/local/bin/minikube
+rm minikube-linux-amd64
+
+echo "Minikube version:"
+minikube version
+
+echo "Installing kubectl..."
+curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+
+echo "kubectl version:"
+kubectl version --client
+
+echo "Starting Minikube with Docker driver..."
+newgrp docker <<EONG
+minikube start --driver=docker
+EONG
+
+echo "Checking Minikube status..."
+minikube status
+
+echo "Kubernetes cluster info:"
+kubectl cluster-info
+
+echo "Kubernetes nodes:"
+kubectl get nodes
+
+echo "✅ Setup complete! You're ready to kubin' 🎉"
+```
+
+### Detailed walkthrough
 It is important to know that other than minikube, there should be a driver installed which is responsible for managing the virtual machines or containers that runs the Kubernetes cluster. It handles the creation, configuration and management of the infrastructure where the Kubernetes cluster will be deployed. 
 
 Let’s use Docker driver because of its lightweight nature and its compatibility with Kubernetes
