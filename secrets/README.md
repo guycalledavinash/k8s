@@ -17,6 +17,21 @@ secrets to Git.
 - Keep at least three replicas when using the included PodDisruptionBudget,
   so voluntary disruptions can maintain two available pods.
 
+## Health checks and graceful termination
+
+- The Deployment uses an HTTP startup probe on `/` every 5 seconds and permits
+  up to 60 seconds for the application to start. Kubernetes does not run the
+  liveness or readiness probes until startup succeeds, avoiding restarts for a
+  healthy application that is still initializing.
+- After startup, readiness checks `/` every 5 seconds so an unhealthy pod is
+  removed from Service endpoints promptly. Liveness checks the same endpoint
+  every 20 seconds and restarts the container only after three consecutive
+  failures, reducing restarts caused by brief transient failures.
+- Pods receive a 30-second termination grace period. The `preStop` hook waits
+  5 seconds before Kubernetes sends SIGTERM, allowing endpoint removal to
+  propagate and in-flight requests to drain during a rolling update or
+  voluntary disruption.
+
 ## Apply
 
 ```sh
