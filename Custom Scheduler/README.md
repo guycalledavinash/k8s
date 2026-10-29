@@ -135,7 +135,7 @@ The upstream deployment currently omits CPU/memory requests; for meaningful reso
 Run the scoring and filtering tests from this directory:
 
 ```sh
-python -m unittest -v extender/test_scheduler.py
+python -m unittest discover -s "Custom Scheduler/extender" -p "test_*.py" -v
 python -m py_compile extender/server.py extender/test_scheduler.py
 ```
 
