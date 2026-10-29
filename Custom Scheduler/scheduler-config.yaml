@@ -1,0 +1,17 @@
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: /etc/kubernetes/scheduler-auth/kubeconfig
+leaderElection:
+  leaderElect: false
+profiles:
+  - schedulerName: regional-poc-scheduler
+extenders:
+  - urlPrefix: http://regional-scheduler-extender.custom-scheduler.svc:8080
+    filterVerb: filter
+    prioritizeVerb: prioritize
+    weight: 1
+    enableHTTPS: false
+    httpTimeout: 2s
+    nodeCacheCapable: false
+    ignorable: false
