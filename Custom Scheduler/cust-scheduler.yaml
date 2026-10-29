@@ -1,1 +1,220 @@
-
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: custom-scheduler
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: regional-scheduler
+  namespace: custom-scheduler
+automountServiceAccountToken: true
+---
+# Use Kubernetes' component roles so the scheduler retains its normal scheduling
+# and volume-placement behavior; the extender has no Kubernetes API credentials.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: regional-scheduler-kube-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: regional-scheduler
+    namespace: custom-scheduler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: regional-scheduler-volume-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:volume-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: regional-scheduler
+    namespace: custom-scheduler
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: regional-scheduler-auth
+  namespace: custom-scheduler
+data:
+  kubeconfig: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: in-cluster
+        cluster:
+          server: https://kubernetes.default.svc
+          certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+      - name: regional-scheduler
+        user:
+          tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+      - name: in-cluster
+        context:
+          cluster: in-cluster
+          user: regional-scheduler
+    current-context: in-cluster
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: regional-scheduler-extender
+  namespace: custom-scheduler
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: regional-scheduler-extender
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: regional-scheduler-extender
+  namespace: custom-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: regional-scheduler-extender
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: regional-scheduler-extender
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: extender
+          image: regional-scheduler-extender:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: WEIGHT_LOCALITY
+              value: "3"
+            - name: WEIGHT_LATENCY
+              value: "2"
+            - name: WEIGHT_CAPACITY
+              value: "2"
+            - name: MAX_LATENCY_MS
+              value: "200"
+            - name: MIN_AVAILABLE_CAPACITY
+              value: "10"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: regional-scheduler
+  namespace: custom-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: regional-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: regional-scheduler
+    spec:
+      serviceAccountName: regional-scheduler
+      containers:
+        - name: kube-scheduler
+          image: registry.k8s.io/kube-scheduler:v1.35.9
+          imagePullPolicy: IfNotPresent
+          command:
+            - kube-scheduler
+          args:
+            - --config=/etc/kubernetes/scheduler-config/scheduler-config.yaml
+            - --authentication-kubeconfig=/etc/kubernetes/scheduler-auth/kubeconfig
+            - --authorization-kubeconfig=/etc/kubernetes/scheduler-auth/kubeconfig
+          ports:
+            - name: https-health
+              containerPort: 10259
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: https-health
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https-health
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: scheduler-config
+              mountPath: /etc/kubernetes/scheduler-config
+              readOnly: true
+            - name: scheduler-auth
+              mountPath: /etc/kubernetes/scheduler-auth
+              readOnly: true
+      volumes:
+        - name: scheduler-config
+          configMap:
+            name: regional-scheduler-config
+        - name: scheduler-auth
+          configMap:
+            name: regional-scheduler-auth
