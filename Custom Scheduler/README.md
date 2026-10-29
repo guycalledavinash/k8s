@@ -132,11 +132,11 @@ The upstream deployment currently omits CPU/memory requests; for meaningful reso
 
 ## Tests and validation
 
-Run the scoring and filtering tests from this directory:
+Run the scoring and filtering tests from the repository root:
 
 ```sh
 python -m unittest discover -s "Custom Scheduler/extender" -p "test_*.py" -v
-python -m py_compile extender/server.py extender/test_scheduler.py
+python -m py_compile "Custom Scheduler/extender/server.py" "Custom Scheduler/extender/test_scheduler.py"
 ```
 
 No AWS credentials, network calls, or live metrics are needed for these tests. For manifest validation, use `kubeconform -kubernetes-version 1.35.9 Custom Scheduler/cust-scheduler.yaml` when available, and validate `scheduler-config.yaml` against the v1.35 kube-scheduler configuration schema. The local POC does not deploy or measure application latency.
