@@ -85,6 +85,8 @@ def node_score(pod: dict[str, Any], node: dict[str, Any], config: Config) -> int
     latency_raw = labels.get(config.latency_label)
     try:
         latency = int(latency_raw)
+        if latency < 0:
+            raise ValueError("latency must not be negative")
     except (TypeError, ValueError):
         latency = config.max_latency_ms
     latency_score = max(0, 100 - min(max(latency, 0), config.max_latency_ms) * 100 // config.max_latency_ms)
@@ -97,8 +99,8 @@ def node_score(pod: dict[str, Any], node: dict[str, Any], config: Config) -> int
         + config.weight_latency * latency_score
         + config.weight_capacity * capacity_score
     )
-    score = round(10 * weighted_total / (
-        config.weight_locality + config.weight_latency + config.weight_capacity
+    score = round(weighted_total / (
+        (config.weight_locality + config.weight_latency + config.weight_capacity) * 10
     ))
     return max(0, min(10, score))
 
