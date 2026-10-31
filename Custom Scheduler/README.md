@@ -151,3 +151,62 @@ kubectl label node worker-a placement.demo/region- placement.demo/demand- placem
 kubectl label node worker-b placement.demo/region- placement.demo/demand- placement.demo/latency-ms- placement.demo/available-capacity-
 kubectl delete -f "Custom Scheduler/cust-scheduler.yaml"
 ```
+
+
+## Prometheus metrics
+
+The extender exposes a standard text exposition endpoint at `GET /metrics` on its existing HTTP port (8080). The Pod template includes Prometheus scrape annotations for `/metrics` on port `8080`; configure your Prometheus deployment to discover annotated Pods.
+
+Available metrics:
+
+- `regional_scheduler_extender_http_requests_total{endpoint,status}`: completed extender HTTP requests, including `/healthz`, `/filter`, `/prioritize`, and a bounded `other` endpoint label for unknown paths. The metrics scrape itself is excluded.
+- `regional_scheduler_extender_request_duration_seconds{endpoint}`: request-duration histogram with fixed buckets from 5 ms through 5 seconds and a `+Inf` bucket.
+- `regional_scheduler_extender_nodes_evaluated_total{operation}`: candidate nodes examined by `filter` and `prioritize`.
+- `regional_scheduler_extender_nodes_rejected_total`: nodes rejected by the simulated capacity filter.
+
+Labels use only fixed endpoint/operation names and HTTP status codes. They do not contain pod names, node names, regions, or request contents. The signals behind the scheduling score remain manually simulated node labels: these metrics do not measure actual application network latency or live regional demand.
+
+Example scrape configuration (adapt job discovery to your cluster's Prometheus installation):
+
+```yaml
+scrape_configs:
+  - job_name: regional-scheduler-extender
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: "([^:]+)(?::\\d+)?;(\\d+)"
+        replacement: "$1:$2"
+        target_label: __address__
+```
+
+Useful PromQL queries:
+
+```promql
+# Request rate by extender endpoint and response status
+sum by (endpoint, status) (rate(regional_scheduler_extender_http_requests_total[5m]))
+
+# Mean request latency over five minutes
+sum by (endpoint) (rate(regional_scheduler_extender_request_duration_seconds_sum[5m]))
+/
+sum by (endpoint) (rate(regional_scheduler_extender_request_duration_seconds_count[5m]))
+
+# Capacity-filter rejection fraction
+sum(rate(regional_scheduler_extender_nodes_rejected_total[5m]))
+/
+clamp_min(sum(rate(regional_scheduler_extender_nodes_evaluated_total{operation="filter"}[5m])), 1)
+
+# Fraction of requests returning HTTP errors
+sum(rate(regional_scheduler_extender_http_requests_total{status=~"4..|5.."}[5m]))
+/
+clamp_min(sum(rate(regional_scheduler_extender_http_requests_total[5m])), 1)
+```
+
+These counters are in-memory and reset when the extender process restarts. The POC has one extender replica; scrape and dashboard availability depend on your Prometheus setup.
