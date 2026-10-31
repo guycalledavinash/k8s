@@ -9,6 +9,8 @@ import json
 import logging
 import math
 import os
+import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -131,27 +133,130 @@ def _pod_identity(pod: dict[str, Any]) -> str:
     return f"{metadata.get('namespace', 'default')}/{metadata.get('name', 'unknown')}"
 
 
-class ExtenderHandler(BaseHTTPRequestHandler):
-    config: Config
 
+
+class Metrics:
+    """Thread-safe in-process Prometheus metrics with bounded label values."""
+
+    BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requests: dict[tuple[str, int], int] = {}
+        self._durations: dict[str, list[float]] = {}
+        self._evaluated: dict[str, int] = {}
+        self._rejected = 0
+
+    def record_request(self, endpoint: str, status: int, duration: float) -> None:
+        with self._lock:
+            key = (endpoint, status)
+            self._requests[key] = self._requests.get(key, 0) + 1
+            state = self._durations.setdefault(endpoint, [0.0, 0.0, *([0.0] * len(self.BUCKETS))])
+            state[0] += 1
+            state[1] += duration
+            for index, bound in enumerate(self.BUCKETS):
+                if duration <= bound:
+                    state[index + 2] += 1
+
+    def add_nodes_evaluated(self, operation: str, count: int) -> None:
+        with self._lock:
+            self._evaluated[operation] = self._evaluated.get(operation, 0) + count
+
+    def add_nodes_rejected(self, count: int) -> None:
+        with self._lock:
+            self._rejected += count
+
+    def render(self) -> bytes:
+        with self._lock:
+            requests = dict(self._requests)
+            durations = {key: value[:] for key, value in self._durations.items()}
+            evaluated = dict(self._evaluated)
+            rejected = self._rejected
+
+        lines = [
+            "# HELP regional_scheduler_extender_http_requests_total HTTP requests handled by endpoint and status.",
+            "# TYPE regional_scheduler_extender_http_requests_total counter",
+        ]
+        for (endpoint, status), count in sorted(requests.items()):
+            lines.append(f'regional_scheduler_extender_http_requests_total{{endpoint="{endpoint}",status="{status}"}} {count}')
+        lines.extend([
+            "# HELP regional_scheduler_extender_request_duration_seconds HTTP request duration in seconds.",
+            "# TYPE regional_scheduler_extender_request_duration_seconds histogram",
+        ])
+        for endpoint, state in sorted(durations.items()):
+            count, total = int(state[0]), state[1]
+            for index, bound in enumerate(self.BUCKETS):
+                lines.append(f'regional_scheduler_extender_request_duration_seconds_bucket{{endpoint="{endpoint}",le="{bound:g}"}} {int(state[index + 2])}')
+            lines.append(f'regional_scheduler_extender_request_duration_seconds_bucket{{endpoint="{endpoint}",le="+Inf"}} {count}')
+            lines.append(f'regional_scheduler_extender_request_duration_seconds_sum{{endpoint="{endpoint}"}} {total:.9f}')
+            lines.append(f'regional_scheduler_extender_request_duration_seconds_count{{endpoint="{endpoint}"}} {count}')
+        lines.extend([
+            "# HELP regional_scheduler_extender_nodes_evaluated_total Candidate nodes evaluated by operation.",
+            "# TYPE regional_scheduler_extender_nodes_evaluated_total counter",
+        ])
+        for operation, count in sorted(evaluated.items()):
+            lines.append(f'regional_scheduler_extender_nodes_evaluated_total{{operation="{operation}"}} {count}')
+        lines.extend([
+            "# HELP regional_scheduler_extender_nodes_rejected_total Candidate nodes rejected by the capacity filter.",
+            "# TYPE regional_scheduler_extender_nodes_rejected_total counter",
+            f"regional_scheduler_extender_nodes_rejected_total {rejected}",
+        ])
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+class ExtenderHandler(BaseHTTPRequestHandler):
+    metrics = Metrics()
+    config: Config
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("http " + fmt, *args)
 
     def _send_json(self, status: int, value: Any) -> None:
+        self._response_status = status
+        self._response_sent = False
         body = json.dumps(value, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self._response_sent = True
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        if self.path == "/metrics":
+            body = self.metrics.render()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        endpoint = "healthz" if self.path == "/healthz" else "other"
+        self._instrument(endpoint, self._handle_get)
+
+    def do_POST(self) -> None:
+        endpoint = {"/filter": "filter", "/prioritize": "prioritize"}.get(self.path, "other")
+        self._instrument(endpoint, self._handle_post)
+
+    def _instrument(self, endpoint: str, handler: Any) -> None:
+        started = time.perf_counter()
+        self._response_status = 500
+        try:
+            handler()
+        except Exception:
+            LOG.exception("request failed endpoint=%s", endpoint)
+            if not getattr(self, "_response_sent", False):
+                self._send_json(500, {"error": "internal server error"})
+        finally:
+            status = getattr(self, "_response_status", 500)
+            self.metrics.record_request(endpoint, status, time.perf_counter() - started)
+
+    def _handle_get(self) -> None:
         if self.path == "/healthz":
             self._send_json(200, {"status": "ok"})
         else:
             self._send_json(404, {"error": "not found"})
 
-    def do_POST(self) -> None:
+    def _handle_post(self) -> None:
         if self.path not in {"/filter", "/prioritize"}:
             self._send_json(404, {"error": "not found"})
             return
@@ -171,17 +276,20 @@ class ExtenderHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/filter":
+            self.metrics.add_nodes_evaluated("filter", len(nodes))
             try:
                 selected, failed = filter_nodes(nodes, self.config)
             except ValueError as exc:
                 self._send_json(400, {"error": str(exc)})
                 return
+            self.metrics.add_nodes_rejected(len(failed))
             self._send_json(200, {
                 "nodes": {**nodes_obj, "items": selected},
                 "failedNodes": failed,
             })
             return
 
+        self.metrics.add_nodes_evaluated("prioritize", len(nodes))
         pod = args["pod"]
         priorities = [
             {"host": (node.get("metadata") or {}).get("name", ""),
